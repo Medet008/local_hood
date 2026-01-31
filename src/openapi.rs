@@ -24,7 +24,11 @@ use utoipa::OpenApi;
         (name = "security", description = "Безопасность: шлагбаум, камеры, домофон"),
         (name = "announcements", description = "Объявления"),
         (name = "marketplace", description = "AllMix - маркетплейс между соседями"),
-        (name = "voting", description = "Голосования собственников")
+        (name = "voting", description = "Голосования собственников"),
+        (name = "communal", description = "Коммунальные услуги: счётчики, счета, оплата"),
+        (name = "Чаты", description = "Чаты и сообщения между соседями"),
+        (name = "Уведомления", description = "Уведомления пользователя"),
+        (name = "Заявки на обслуживание", description = "Заявки на ремонт и обслуживание")
     ),
     paths(
         // Auth
@@ -97,6 +101,34 @@ use utoipa::OpenApi;
         crate::api::voting::create_voting,
         crate::api::voting::cast_vote,
         crate::api::voting::close_voting,
+        // Communal
+        crate::api::communal::get_meters,
+        crate::api::communal::submit_reading,
+        crate::api::communal::get_readings_history,
+        crate::api::communal::get_bills,
+        crate::api::communal::get_bill,
+        crate::api::communal::create_payment,
+        crate::api::communal::get_payment,
+        // Chat
+        crate::api::chat::list_chats,
+        crate::api::chat::create_private_chat,
+        crate::api::chat::get_messages,
+        crate::api::chat::send_message,
+        crate::api::chat::mark_chat_as_read,
+        // Notifications
+        crate::api::notifications::list_notifications,
+        crate::api::notifications::mark_as_read,
+        crate::api::notifications::mark_all_as_read,
+        crate::api::notifications::register_push_token,
+        crate::api::notifications::get_unread_count,
+        // Maintenance
+        crate::api::maintenance::list_requests,
+        crate::api::maintenance::get_request,
+        crate::api::maintenance::create_request,
+        crate::api::maintenance::update_status,
+        crate::api::maintenance::rate_request,
+        crate::api::maintenance::get_comments,
+        crate::api::maintenance::add_comment,
     ),
     components(
         schemas(
@@ -187,6 +219,50 @@ use utoipa::OpenApi;
             crate::api::voting::SuccessResponse,
             crate::api::voting::VoteResponse,
             crate::api::voting::VotingsQuery,
+            // Communal
+            crate::models::MeterResponse,
+            crate::models::MeterReading,
+            crate::models::SubmitReadingRequest,
+            crate::models::BillResponse,
+            crate::models::BillItemResponse,
+            crate::models::BillStatus,
+            crate::models::CreatePaymentRequest,
+            crate::models::PaymentResponse,
+            crate::models::PaymentStatus,
+            crate::models::PaymentMethod,
+            crate::api::communal::SubmitReadingResponse,
+            crate::api::communal::BillsQuery,
+            // Chat
+            crate::models::ChatResponse,
+            crate::models::ChatType,
+            crate::models::MessagePreview,
+            crate::models::ChatMessageResponse,
+            crate::models::SenderInfo,
+            crate::models::CreatePrivateChatRequest,
+            crate::models::SendChatMessageRequest,
+            crate::models::MessagesQuery,
+            crate::api::chat::ChatSuccessResponse,
+            // Notifications
+            crate::models::NotificationResponse,
+            crate::models::NotificationType,
+            crate::models::NotificationsQuery,
+            crate::models::RegisterPushTokenRequest,
+            crate::api::notifications::NotificationSuccessResponse,
+            crate::api::notifications::MarkAllReadResponse,
+            crate::api::notifications::UnreadCountResponse,
+            // Maintenance
+            crate::models::MaintenanceRequestResponse,
+            crate::models::MaintenancePhotoResponse,
+            crate::models::MaintenanceCategory,
+            crate::models::MaintenancePriority,
+            crate::models::MaintenanceStatus,
+            crate::models::CreateMaintenanceRequest,
+            crate::models::UpdateMaintenanceStatusRequest,
+            crate::models::RateMaintenanceRequest,
+            crate::models::AddMaintenanceCommentRequest,
+            crate::api::maintenance::MaintenanceSuccessResponse,
+            crate::api::maintenance::CommentCreatedResponse,
+            crate::api::maintenance::CommentResponse,
         )
     ),
     modifiers(&SecurityAddon)

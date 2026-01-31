@@ -11,10 +11,16 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 use crate::middleware::{AppState, AuthUser};
 use crate::models::{
-    Bill, BillItem, BillItemResponse, BillResponse, CreatePaymentRequest,
-    Meter, MeterReading, MeterResponse, PaymentResponse, PaymentStatus,
-    SubmitReadingRequest,
+    Bill, BillItem, BillItemResponse, BillResponse, CreatePaymentRequest, Meter, MeterReading,
+    MeterResponse, PaymentResponse, PaymentStatus, SubmitReadingRequest,
 };
+
+/// Ответ на подачу показаний
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct SubmitReadingResponse {
+    pub success: bool,
+    pub consumption: Option<rust_decimal::Decimal>,
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -27,21 +33,20 @@ pub fn routes() -> Router<AppState> {
         .route("/payments/:id", get(get_payment))
 }
 
-#[derive(Debug, Deserialize)]
-struct BillsQuery {
-    apartment_id: Option<Uuid>,
-    status: Option<String>,
-    page: Option<i64>,
-    limit: Option<i64>,
+#[derive(Debug, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+pub struct BillsQuery {
+    pub apartment_id: Option<Uuid>,
+    pub status: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 async fn get_user_apartments(state: &AppState, user_id: Uuid) -> AppResult<Vec<Uuid>> {
-    let apartments: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM apartments WHERE owner_id = $1 OR resident_id = $1"
-    )
-    .bind(user_id)
-    .fetch_all(&state.pool)
-    .await?;
+    let apartments: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM apartments WHERE owner_id = $1 OR resident_id = $1")
+            .bind(user_id)
+            .fetch_all(&state.pool)
+            .await?;
 
     if apartments.is_empty() {
         return Err(AppError::Forbidden);
@@ -50,7 +55,19 @@ async fn get_user_apartments(state: &AppState, user_id: Uuid) -> AppResult<Vec<U
     Ok(apartments.into_iter().map(|(id,)| id).collect())
 }
 
-async fn get_meters(
+/// Получить счётчики
+#[utoipa::path(
+    get,
+    path = "/api/v1/communal/meters",
+    tag = "communal",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Список счётчиков", body = Vec<MeterResponse>),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет квартир")
+    )
+)]
+pub async fn get_meters(
     State(state): State<AppState>,
     auth_user: AuthUser,
 ) -> AppResult<Json<Vec<MeterResponse>>> {
@@ -72,7 +89,7 @@ async fn get_meters(
             WHERE meter_id = $1
             ORDER BY reading_date DESC
             LIMIT 1
-            "#
+            "#,
         )
         .bind(meter.id)
         .fetch_optional(&state.pool)
@@ -91,33 +108,44 @@ async fn get_meters(
     Ok(Json(response))
 }
 
-async fn submit_reading(
+/// Подать показания счётчика
+#[utoipa::path(
+    post,
+    path = "/api/v1/communal/meters/readings",
+    tag = "communal",
+    security(("bearer_auth" = [])),
+    request_body = SubmitReadingRequest,
+    responses(
+        (status = 200, description = "Показания приняты", body = SubmitReadingResponse),
+        (status = 400, description = "Показание меньше предыдущего"),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа"),
+        (status = 404, description = "Счётчик не найден")
+    )
+)]
+pub async fn submit_reading(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Json(payload): Json<SubmitReadingRequest>,
 ) -> AppResult<Json<Value>> {
-    // Проверяем, что счетчик принадлежит пользователю
-    let meter = sqlx::query_as::<_, Meter>(
-        "SELECT * FROM meters WHERE id = $1"
-    )
-    .bind(payload.meter_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Счетчик не найден".to_string()))?;
+    let meter = sqlx::query_as::<_, Meter>("SELECT * FROM meters WHERE id = $1")
+        .bind(payload.meter_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Счетчик не найден".to_string()))?;
 
     let apartment_ids = get_user_apartments(&state, auth_user.user_id).await?;
     if !apartment_ids.contains(&meter.apartment_id) {
         return Err(AppError::Forbidden);
     }
 
-    // Получаем предыдущее показание
     let previous: Option<(rust_decimal::Decimal,)> = sqlx::query_as(
         r#"
         SELECT value FROM meter_readings
         WHERE meter_id = $1
         ORDER BY reading_date DESC
         LIMIT 1
-        "#
+        "#,
     )
     .bind(payload.meter_id)
     .fetch_optional(&state.pool)
@@ -126,10 +154,11 @@ async fn submit_reading(
     let previous_value = previous.map(|(v,)| v);
     let consumption = previous_value.map(|pv| payload.value - pv);
 
-    // Проверяем, что показание больше предыдущего
     if let Some(pv) = previous_value {
         if payload.value < pv {
-            return Err(AppError::BadRequest("Показание не может быть меньше предыдущего".to_string()));
+            return Err(AppError::BadRequest(
+                "Показание не может быть меньше предыдущего".to_string(),
+            ));
         }
     }
 
@@ -158,18 +187,35 @@ async fn submit_reading(
     })))
 }
 
-async fn get_readings_history(
+/// Получить историю показаний счётчика
+#[utoipa::path(
+    get,
+    path = "/api/v1/communal/meters/readings/history",
+    tag = "communal",
+    security(("bearer_auth" = [])),
+    params(
+        ("meter_id" = Uuid, Query, description = "ID счётчика")
+    ),
+    responses(
+        (status = 200, description = "История показаний", body = Vec<MeterReading>),
+        (status = 400, description = "meter_id обязателен"),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа"),
+        (status = 404, description = "Счётчик не найден")
+    )
+)]
+pub async fn get_readings_history(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> AppResult<Json<Vec<MeterReading>>> {
-    let meter_id = params.get("meter_id")
+    let meter_id = params
+        .get("meter_id")
         .ok_or_else(|| AppError::BadRequest("meter_id обязателен".to_string()))?;
 
     let meter_uuid = Uuid::parse_str(meter_id)
         .map_err(|_| AppError::BadRequest("Неверный формат meter_id".to_string()))?;
 
-    // Проверяем доступ
     let meter = sqlx::query_as::<_, Meter>("SELECT * FROM meters WHERE id = $1")
         .bind(meter_uuid)
         .fetch_optional(&state.pool)
@@ -187,7 +233,7 @@ async fn get_readings_history(
         WHERE meter_id = $1
         ORDER BY reading_date DESC
         LIMIT 12
-        "#
+        "#,
     )
     .bind(meter_uuid)
     .fetch_all(&state.pool)
@@ -196,7 +242,25 @@ async fn get_readings_history(
     Ok(Json(readings))
 }
 
-async fn get_bills(
+/// Получить счета
+#[utoipa::path(
+    get,
+    path = "/api/v1/communal/bills",
+    tag = "communal",
+    security(("bearer_auth" = [])),
+    params(
+        ("apartment_id" = Option<Uuid>, Query, description = "ID квартиры"),
+        ("status" = Option<String>, Query, description = "Статус счёта"),
+        ("page" = Option<i64>, Query, description = "Номер страницы"),
+        ("limit" = Option<i64>, Query, description = "Количество записей")
+    ),
+    responses(
+        (status = 200, description = "Список счетов", body = Vec<BillResponse>),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет квартир")
+    )
+)]
+pub async fn get_bills(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Query(query): Query<BillsQuery>,
@@ -214,7 +278,7 @@ async fn get_bills(
           AND ($3::varchar IS NULL OR status::text = $3)
         ORDER BY period_end DESC
         LIMIT $4 OFFSET $5
-        "#
+        "#,
     )
     .bind(&apartment_ids)
     .bind(&query.apartment_id)
@@ -226,12 +290,10 @@ async fn get_bills(
 
     let mut response = Vec::new();
     for bill in bills {
-        let items = sqlx::query_as::<_, BillItem>(
-            "SELECT * FROM bill_items WHERE bill_id = $1"
-        )
-        .bind(bill.id)
-        .fetch_all(&state.pool)
-        .await?;
+        let items = sqlx::query_as::<_, BillItem>("SELECT * FROM bill_items WHERE bill_id = $1")
+            .bind(bill.id)
+            .fetch_all(&state.pool)
+            .await?;
 
         response.push(BillResponse {
             id: bill.id,
@@ -242,42 +304,57 @@ async fn get_bills(
             total_amount: bill.total_amount,
             status: bill.status,
             due_date: bill.due_date,
-            items: items.into_iter().map(|i| BillItemResponse {
-                utility_type: i.utility_type,
-                description: i.description,
-                quantity: i.quantity,
-                unit: i.unit,
-                rate: i.rate,
-                amount: i.amount,
-            }).collect(),
+            items: items
+                .into_iter()
+                .map(|i| BillItemResponse {
+                    utility_type: i.utility_type,
+                    description: i.description,
+                    quantity: i.quantity,
+                    unit: i.unit,
+                    rate: i.rate,
+                    amount: i.amount,
+                })
+                .collect(),
         });
     }
 
     Ok(Json(response))
 }
 
-async fn get_bill(
+/// Получить счёт по ID
+#[utoipa::path(
+    get,
+    path = "/api/v1/communal/bills/{id}",
+    tag = "communal",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID счёта")
+    ),
+    responses(
+        (status = 200, description = "Счёт", body = BillResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 404, description = "Счёт не найден")
+    )
+)]
+pub async fn get_bill(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<BillResponse>> {
     let apartment_ids = get_user_apartments(&state, auth_user.user_id).await?;
 
-    let bill = sqlx::query_as::<_, Bill>(
-        "SELECT * FROM bills WHERE id = $1 AND apartment_id = ANY($2)"
-    )
-    .bind(id)
-    .bind(&apartment_ids)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Счёт не найден".to_string()))?;
+    let bill =
+        sqlx::query_as::<_, Bill>("SELECT * FROM bills WHERE id = $1 AND apartment_id = ANY($2)")
+            .bind(id)
+            .bind(&apartment_ids)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Счёт не найден".to_string()))?;
 
-    let items = sqlx::query_as::<_, BillItem>(
-        "SELECT * FROM bill_items WHERE bill_id = $1"
-    )
-    .bind(bill.id)
-    .fetch_all(&state.pool)
-    .await?;
+    let items = sqlx::query_as::<_, BillItem>("SELECT * FROM bill_items WHERE bill_id = $1")
+        .bind(bill.id)
+        .fetch_all(&state.pool)
+        .await?;
 
     Ok(Json(BillResponse {
         id: bill.id,
@@ -288,45 +365,59 @@ async fn get_bill(
         total_amount: bill.total_amount,
         status: bill.status,
         due_date: bill.due_date,
-        items: items.into_iter().map(|i| BillItemResponse {
-            utility_type: i.utility_type,
-            description: i.description,
-            quantity: i.quantity,
-            unit: i.unit,
-            rate: i.rate,
-            amount: i.amount,
-        }).collect(),
+        items: items
+            .into_iter()
+            .map(|i| BillItemResponse {
+                utility_type: i.utility_type,
+                description: i.description,
+                quantity: i.quantity,
+                unit: i.unit,
+                rate: i.rate,
+                amount: i.amount,
+            })
+            .collect(),
     }))
 }
 
-async fn create_payment(
+/// Создать платёж
+#[utoipa::path(
+    post,
+    path = "/api/v1/communal/payments",
+    tag = "communal",
+    security(("bearer_auth" = [])),
+    request_body = CreatePaymentRequest,
+    responses(
+        (status = 200, description = "Платёж создан", body = PaymentResponse),
+        (status = 400, description = "Счёт уже оплачен"),
+        (status = 401, description = "Не авторизован"),
+        (status = 404, description = "Счёт не найден")
+    )
+)]
+pub async fn create_payment(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Json(payload): Json<CreatePaymentRequest>,
 ) -> AppResult<Json<PaymentResponse>> {
     let apartment_ids = get_user_apartments(&state, auth_user.user_id).await?;
 
-    // Проверяем счёт
-    let bill = sqlx::query_as::<_, Bill>(
-        "SELECT * FROM bills WHERE id = $1 AND apartment_id = ANY($2)"
-    )
-    .bind(payload.bill_id)
-    .bind(&apartment_ids)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Счёт не найден".to_string()))?;
+    let bill =
+        sqlx::query_as::<_, Bill>("SELECT * FROM bills WHERE id = $1 AND apartment_id = ANY($2)")
+            .bind(payload.bill_id)
+            .bind(&apartment_ids)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Счёт не найден".to_string()))?;
 
     if bill.status == crate::models::BillStatus::Paid {
         return Err(AppError::BadRequest("Счёт уже оплачен".to_string()));
     }
 
-    // Создаем платеж
     let payment = sqlx::query_as::<_, crate::models::Payment>(
         r#"
         INSERT INTO payments (bill_id, apartment_id, user_id, amount, method, status)
         VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING *
-        "#
+        "#,
     )
     .bind(payload.bill_id)
     .bind(bill.apartment_id)
@@ -336,9 +427,6 @@ async fn create_payment(
     .bind(PaymentStatus::Pending)
     .fetch_one(&state.pool)
     .await?;
-
-    // Здесь была бы интеграция с платежной системой
-    // Для демонстрации сразу помечаем как выполненный
 
     Ok(Json(PaymentResponse {
         id: payment.id,
@@ -350,13 +438,28 @@ async fn create_payment(
     }))
 }
 
-async fn get_payment(
+/// Получить платёж по ID
+#[utoipa::path(
+    get,
+    path = "/api/v1/communal/payments/{id}",
+    tag = "communal",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID платежа")
+    ),
+    responses(
+        (status = 200, description = "Платёж", body = PaymentResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 404, description = "Платёж не найден")
+    )
+)]
+pub async fn get_payment(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<PaymentResponse>> {
     let payment = sqlx::query_as::<_, crate::models::Payment>(
-        "SELECT * FROM payments WHERE id = $1 AND user_id = $2"
+        "SELECT * FROM payments WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
     .bind(auth_user.user_id)

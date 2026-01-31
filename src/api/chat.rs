@@ -3,16 +3,22 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::middleware::{AppState, AuthUser};
 use crate::models::{
-    Chat, ChatMessage, ChatMessageResponse, ChatResponse, ChatType,
-    CreatePrivateChatRequest, MessagePreview, MessagesQuery, SendChatMessageRequest,
-    SenderInfo,
+    Chat, ChatMessage, ChatMessageResponse, ChatResponse, ChatType, CreatePrivateChatRequest,
+    MessagePreview, MessagesQuery, SendChatMessageRequest, SenderInfo,
 };
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ChatSuccessResponse {
+    pub success: bool,
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -31,7 +37,7 @@ async fn get_user_complex(state: &AppState, user_id: Uuid) -> AppResult<Uuid> {
         JOIN apartments a ON a.complex_id = c.id
         WHERE a.owner_id = $1 OR a.resident_id = $1
         LIMIT 1
-        "#
+        "#,
     )
     .bind(user_id)
     .fetch_optional(&state.pool)
@@ -40,6 +46,18 @@ async fn get_user_complex(state: &AppState, user_id: Uuid) -> AppResult<Uuid> {
     complex.map(|(id,)| id).ok_or_else(|| AppError::Forbidden)
 }
 
+/// Получить список чатов пользователя
+#[utoipa::path(
+    get,
+    path = "/api/chats",
+    tag = "Чаты",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Список чатов", body = Vec<ChatResponse>),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа")
+    )
+)]
 async fn list_chats(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -55,7 +73,7 @@ async fn list_chats(
            OR cm.user_id = $2
         GROUP BY c.id
         ORDER BY c.updated_at DESC
-        "#
+        "#,
     )
     .bind(complex_id)
     .bind(auth_user.user_id)
@@ -71,19 +89,18 @@ async fn list_chats(
             WHERE chat_id = $1 AND is_deleted = false
             ORDER BY created_at DESC
             LIMIT 1
-            "#
+            "#,
         )
         .bind(chat.id)
         .fetch_optional(&state.pool)
         .await?;
 
         let last_message_preview = if let Some((content, sender_id, created_at)) = last_message {
-            let sender_name: (String,) = sqlx::query_as(
-                "SELECT COALESCE(first_name, phone) FROM users WHERE id = $1"
-            )
-            .bind(sender_id)
-            .fetch_one(&state.pool)
-            .await?;
+            let sender_name: (String,) =
+                sqlx::query_as("SELECT COALESCE(first_name, phone) FROM users WHERE id = $1")
+                    .bind(sender_id)
+                    .fetch_one(&state.pool)
+                    .await?;
 
             Some(MessagePreview {
                 content,
@@ -99,19 +116,18 @@ async fn list_chats(
             SELECT COUNT(*) FROM chat_messages m
             LEFT JOIN message_reads r ON r.message_id = m.id AND r.user_id = $2
             WHERE m.chat_id = $1 AND r.id IS NULL AND m.sender_id != $2
-            "#
+            "#,
         )
         .bind(chat.id)
         .bind(auth_user.user_id)
         .fetch_one(&state.pool)
         .await?;
 
-        let members_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM chat_members WHERE chat_id = $1"
-        )
-        .bind(chat.id)
-        .fetch_one(&state.pool)
-        .await?;
+        let members_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM chat_members WHERE chat_id = $1")
+                .bind(chat.id)
+                .fetch_one(&state.pool)
+                .await?;
 
         response.push(ChatResponse {
             id: chat.id,
@@ -126,18 +142,29 @@ async fn list_chats(
     Ok(Json(response))
 }
 
+/// Создать приватный чат с пользователем
+#[utoipa::path(
+    post,
+    path = "/api/chats/private",
+    tag = "Чаты",
+    security(("bearer_auth" = [])),
+    request_body = CreatePrivateChatRequest,
+    responses(
+        (status = 200, description = "Чат создан", body = ChatResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 404, description = "Пользователь не найден")
+    )
+)]
 async fn create_private_chat(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Json(payload): Json<CreatePrivateChatRequest>,
 ) -> AppResult<Json<ChatResponse>> {
     // Проверяем, что пользователь существует
-    let user_exists: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM users WHERE id = $1"
-    )
-    .bind(payload.user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let user_exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM users WHERE id = $1")
+        .bind(payload.user_id)
+        .fetch_optional(&state.pool)
+        .await?;
 
     if user_exists.is_none() {
         return Err(AppError::NotFound("Пользователь не найден".to_string()));
@@ -150,7 +177,7 @@ async fn create_private_chat(
         JOIN chat_members cm1 ON cm1.chat_id = c.id AND cm1.user_id = $1
         JOIN chat_members cm2 ON cm2.chat_id = c.id AND cm2.user_id = $2
         WHERE c.chat_type = 'private'
-        "#
+        "#,
     )
     .bind(auth_user.user_id)
     .bind(payload.user_id)
@@ -166,21 +193,19 @@ async fn create_private_chat(
             INSERT INTO chats (chat_type, is_private, created_by)
             VALUES ('private', true, $1)
             RETURNING id
-            "#
+            "#,
         )
         .bind(auth_user.user_id)
         .fetch_one(&state.pool)
         .await?;
 
         // Добавляем участников
-        sqlx::query(
-            "INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2), ($1, $3)"
-        )
-        .bind(chat.0)
-        .bind(auth_user.user_id)
-        .bind(payload.user_id)
-        .execute(&state.pool)
-        .await?;
+        sqlx::query("INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2), ($1, $3)")
+            .bind(chat.0)
+            .bind(auth_user.user_id)
+            .bind(payload.user_id)
+            .execute(&state.pool)
+            .await?;
 
         chat.0
     };
@@ -200,6 +225,24 @@ async fn create_private_chat(
     }))
 }
 
+/// Получить сообщения чата
+#[utoipa::path(
+    get,
+    path = "/api/chats/{id}/messages",
+    tag = "Чаты",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID чата"),
+        ("limit" = Option<i64>, Query, description = "Лимит сообщений"),
+        ("before" = Option<Uuid>, Query, description = "Получить сообщения до указанного ID")
+    ),
+    responses(
+        (status = 200, description = "Список сообщений", body = Vec<ChatMessageResponse>),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа к чату"),
+        (status = 404, description = "Чат не найден")
+    )
+)]
 async fn get_messages(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -221,7 +264,7 @@ async fn get_messages(
             WHERE chat_id = $1 AND is_deleted = false AND id < $2
             ORDER BY created_at DESC
             LIMIT $3
-            "#
+            "#,
         )
         .bind(chat_id)
         .bind(before_id)
@@ -235,7 +278,7 @@ async fn get_messages(
             WHERE chat_id = $1 AND is_deleted = false
             ORDER BY created_at DESC
             LIMIT $2
-            "#
+            "#,
         )
         .bind(chat_id)
         .bind(limit)
@@ -246,7 +289,7 @@ async fn get_messages(
     let mut response = Vec::new();
     for msg in messages {
         let sender: (Uuid, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT id, COALESCE(first_name, phone), avatar_url FROM users WHERE id = $1"
+            "SELECT id, COALESCE(first_name, phone), avatar_url FROM users WHERE id = $1",
         )
         .bind(msg.sender_id)
         .fetch_one(&state.pool)
@@ -259,7 +302,11 @@ async fn get_messages(
                 name: sender.1.unwrap_or_default(),
                 avatar_url: sender.2,
             },
-            content: if msg.is_deleted { "Сообщение удалено".to_string() } else { msg.content },
+            content: if msg.is_deleted {
+                "Сообщение удалено".to_string()
+            } else {
+                msg.content
+            },
             attachment_url: msg.attachment_url,
             attachment_type: msg.attachment_type,
             reply_to: None, // Упрощено
@@ -275,6 +322,23 @@ async fn get_messages(
     Ok(Json(response))
 }
 
+/// Отправить сообщение в чат
+#[utoipa::path(
+    post,
+    path = "/api/chats/{id}/messages",
+    tag = "Чаты",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID чата")
+    ),
+    request_body = SendChatMessageRequest,
+    responses(
+        (status = 200, description = "Сообщение отправлено", body = ChatMessageResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа к чату"),
+        (status = 404, description = "Чат не найден")
+    )
+)]
 async fn send_message(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -309,7 +373,7 @@ async fn send_message(
         .await?;
 
     let sender: (Uuid, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT id, COALESCE(first_name, phone), avatar_url FROM users WHERE id = $1"
+        "SELECT id, COALESCE(first_name, phone), avatar_url FROM users WHERE id = $1",
     )
     .bind(auth_user.user_id)
     .fetch_one(&state.pool)
@@ -332,6 +396,22 @@ async fn send_message(
     }))
 }
 
+/// Отметить чат как прочитанный
+#[utoipa::path(
+    post,
+    path = "/api/chats/{id}/read",
+    tag = "Чаты",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID чата")
+    ),
+    responses(
+        (status = 200, description = "Чат отмечен как прочитанный", body = ChatSuccessResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа к чату"),
+        (status = 404, description = "Чат не найден")
+    )
+)]
 async fn mark_chat_as_read(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -362,7 +442,7 @@ async fn check_chat_access(state: &AppState, chat_id: Uuid, user_id: Uuid) -> Ap
                     r#"
                     SELECT 1 FROM apartments
                     WHERE complex_id = $1 AND (owner_id = $2 OR resident_id = $2)
-                    "#
+                    "#,
                 )
                 .bind(complex_id)
                 .bind(user_id)
@@ -375,13 +455,12 @@ async fn check_chat_access(state: &AppState, chat_id: Uuid, user_id: Uuid) -> Ap
         }
         ChatType::Private | ChatType::Support => {
             // Проверяем членство
-            let is_member: Option<(i32,)> = sqlx::query_as(
-                "SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2"
-            )
-            .bind(chat_id)
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await?;
+            let is_member: Option<(i32,)> =
+                sqlx::query_as("SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2")
+                    .bind(chat_id)
+                    .bind(user_id)
+                    .fetch_optional(&state.pool)
+                    .await?;
             Ok(is_member.is_some())
         }
     }
@@ -395,7 +474,7 @@ async fn mark_messages_as_read(state: &AppState, chat_id: Uuid, user_id: Uuid) -
         FROM chat_messages m
         LEFT JOIN message_reads r ON r.message_id = m.id AND r.user_id = $2
         WHERE m.chat_id = $1 AND r.id IS NULL AND m.sender_id != $2
-        "#
+        "#,
     )
     .bind(chat_id)
     .bind(user_id)
@@ -403,13 +482,11 @@ async fn mark_messages_as_read(state: &AppState, chat_id: Uuid, user_id: Uuid) -
     .await?;
 
     // Обновляем last_read_at
-    sqlx::query(
-        "UPDATE chat_members SET last_read_at = NOW() WHERE chat_id = $1 AND user_id = $2"
-    )
-    .bind(chat_id)
-    .bind(user_id)
-    .execute(&state.pool)
-    .await?;
+    sqlx::query("UPDATE chat_members SET last_read_at = NOW() WHERE chat_id = $1 AND user_id = $2")
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&state.pool)
+        .await?;
 
     Ok(())
 }

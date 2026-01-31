@@ -3,18 +3,37 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::middleware::{is_chairman_or_higher, AppState, AuthUser};
 use crate::models::{
-    AddMaintenanceCommentRequest, CreateMaintenanceRequest, MaintenanceComment,
-    MaintenancePhoto, MaintenancePhotoResponse, MaintenancePriority,
-    MaintenanceRequest, MaintenanceRequestResponse, MaintenanceStatus,
-    RateMaintenanceRequest, UpdateMaintenanceStatusRequest,
+    AddMaintenanceCommentRequest, CreateMaintenanceRequest, MaintenanceComment, MaintenancePhoto,
+    MaintenancePhotoResponse, MaintenancePriority, MaintenanceRequest, MaintenanceRequestResponse,
+    MaintenanceStatus, RateMaintenanceRequest, UpdateMaintenanceStatusRequest,
 };
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MaintenanceSuccessResponse {
+    pub success: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CommentCreatedResponse {
+    pub success: bool,
+    pub comment_id: Uuid,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CommentResponse {
+    pub id: Uuid,
+    pub content: String,
+    pub author: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -27,7 +46,7 @@ pub fn routes() -> Router<AppState> {
         .route("/:id/comments", post(add_comment))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct RequestsQuery {
     status: Option<String>,
     category: Option<String>,
@@ -43,7 +62,7 @@ async fn get_user_complex(state: &AppState, user_id: Uuid) -> AppResult<Uuid> {
         JOIN apartments a ON a.complex_id = c.id
         WHERE a.owner_id = $1 OR a.resident_id = $1
         LIMIT 1
-        "#
+        "#,
     )
     .bind(user_id)
     .fetch_optional(&state.pool)
@@ -52,6 +71,24 @@ async fn get_user_complex(state: &AppState, user_id: Uuid) -> AppResult<Uuid> {
     complex.map(|(id,)| id).ok_or_else(|| AppError::Forbidden)
 }
 
+/// Получить список заявок на обслуживание
+#[utoipa::path(
+    get,
+    path = "/api/maintenance",
+    tag = "Заявки на обслуживание",
+    security(("bearer_auth" = [])),
+    params(
+        ("status" = Option<String>, Query, description = "Фильтр по статусу"),
+        ("category" = Option<String>, Query, description = "Фильтр по категории"),
+        ("page" = Option<i64>, Query, description = "Номер страницы"),
+        ("limit" = Option<i64>, Query, description = "Лимит записей")
+    ),
+    responses(
+        (status = 200, description = "Список заявок", body = Vec<MaintenanceRequestResponse>),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа")
+    )
+)]
 async fn list_requests(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -77,7 +114,7 @@ async fn list_requests(
             END,
             created_at DESC
         LIMIT $4 OFFSET $5
-        "#
+        "#,
     )
     .bind(complex_id)
     .bind(&query.status)
@@ -101,7 +138,7 @@ async fn build_request_response(
 ) -> AppResult<MaintenanceRequestResponse> {
     let assigned_name: Option<String> = if let Some(worker_id) = req.assigned_to {
         sqlx::query_as::<_, (String, String)>(
-            "SELECT first_name, last_name FROM osi_workers WHERE id = $1"
+            "SELECT first_name, last_name FROM osi_workers WHERE id = $1",
         )
         .bind(worker_id)
         .fetch_optional(&state.pool)
@@ -112,18 +149,17 @@ async fn build_request_response(
     };
 
     let photos = sqlx::query_as::<_, MaintenancePhoto>(
-        "SELECT * FROM maintenance_photos WHERE request_id = $1 ORDER BY is_before DESC"
+        "SELECT * FROM maintenance_photos WHERE request_id = $1 ORDER BY is_before DESC",
     )
     .bind(req.id)
     .fetch_all(&state.pool)
     .await?;
 
-    let comments_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM maintenance_comments WHERE request_id = $1"
-    )
-    .bind(req.id)
-    .fetch_one(&state.pool)
-    .await?;
+    let comments_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM maintenance_comments WHERE request_id = $1")
+            .bind(req.id)
+            .fetch_one(&state.pool)
+            .await?;
 
     Ok(MaintenanceRequestResponse {
         id: req.id,
@@ -134,16 +170,35 @@ async fn build_request_response(
         priority: req.priority.clone(),
         status: req.status.clone(),
         assigned_to_name: assigned_name,
-        photos: photos.into_iter().map(|p| MaintenancePhotoResponse {
-            url: p.url,
-            is_before: p.is_before,
-        }).collect(),
+        photos: photos
+            .into_iter()
+            .map(|p| MaintenancePhotoResponse {
+                url: p.url,
+                is_before: p.is_before,
+            })
+            .collect(),
         comments_count: comments_count.0 as i32,
         rating: req.rating,
         created_at: req.created_at,
     })
 }
 
+/// Получить заявку по ID
+#[utoipa::path(
+    get,
+    path = "/api/maintenance/{id}",
+    tag = "Заявки на обслуживание",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID заявки")
+    ),
+    responses(
+        (status = 200, description = "Данные заявки", body = MaintenanceRequestResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа"),
+        (status = 404, description = "Заявка не найдена")
+    )
+)]
 async fn get_request(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -152,7 +207,7 @@ async fn get_request(
     let complex_id = get_user_complex(&state, auth_user.user_id).await?;
 
     let req = sqlx::query_as::<_, MaintenanceRequest>(
-        "SELECT * FROM maintenance_requests WHERE id = $1 AND complex_id = $2"
+        "SELECT * FROM maintenance_requests WHERE id = $1 AND complex_id = $2",
     )
     .bind(id)
     .bind(complex_id)
@@ -164,6 +219,19 @@ async fn get_request(
     Ok(Json(response))
 }
 
+/// Создать заявку на обслуживание
+#[utoipa::path(
+    post,
+    path = "/api/maintenance",
+    tag = "Заявки на обслуживание",
+    security(("bearer_auth" = [])),
+    request_body = CreateMaintenanceRequest,
+    responses(
+        (status = 200, description = "Заявка создана", body = MaintenanceRequestResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа")
+    )
+)]
 async fn create_request(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -179,7 +247,7 @@ async fn create_request(
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING *
-        "#
+        "#,
     )
     .bind(complex_id)
     .bind(&payload.apartment_id)
@@ -188,7 +256,12 @@ async fn create_request(
     .bind(&payload.title)
     .bind(&payload.description)
     .bind(&payload.location)
-    .bind(payload.priority.clone().unwrap_or(MaintenancePriority::Normal))
+    .bind(
+        payload
+            .priority
+            .clone()
+            .unwrap_or(MaintenancePriority::Normal),
+    )
     .bind(MaintenanceStatus::New)
     .fetch_one(&state.pool)
     .await?;
@@ -197,32 +270,48 @@ async fn create_request(
     Ok(Json(response))
 }
 
+/// Обновить статус заявки
+#[utoipa::path(
+    put,
+    path = "/api/maintenance/{id}/status",
+    tag = "Заявки на обслуживание",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID заявки")
+    ),
+    request_body = UpdateMaintenanceStatusRequest,
+    responses(
+        (status = 200, description = "Статус обновлён", body = MaintenanceRequestResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет прав на изменение"),
+        (status = 404, description = "Заявка не найдена")
+    )
+)]
 async fn update_status(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateMaintenanceStatusRequest>,
 ) -> AppResult<Json<MaintenanceRequestResponse>> {
-    let req = sqlx::query_as::<_, MaintenanceRequest>(
-        "SELECT * FROM maintenance_requests WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Заявка не найдена".to_string()))?;
+    let req =
+        sqlx::query_as::<_, MaintenanceRequest>("SELECT * FROM maintenance_requests WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Заявка не найдена".to_string()))?;
 
     // Проверяем права (председатель или автор заявки для отмены)
-    let is_chairman: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM osi WHERE complex_id = $1 AND chairman_id = $2"
-    )
-    .bind(req.complex_id)
-    .bind(auth_user.user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let is_chairman: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM osi WHERE complex_id = $1 AND chairman_id = $2")
+            .bind(req.complex_id)
+            .bind(auth_user.user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     let can_update = is_chairman.is_some()
         || is_chairman_or_higher(&auth_user.role)
-        || (req.requester_id == auth_user.user_id && payload.status == MaintenanceStatus::Cancelled);
+        || (req.requester_id == auth_user.user_id
+            && payload.status == MaintenanceStatus::Cancelled);
 
     if !can_update {
         return Err(AppError::Forbidden);
@@ -243,7 +332,7 @@ async fn update_status(
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
-        "#
+        "#,
     )
     .bind(id)
     .bind(&payload.status)
@@ -256,30 +345,51 @@ async fn update_status(
     Ok(Json(response))
 }
 
+/// Оценить выполненную заявку
+#[utoipa::path(
+    post,
+    path = "/api/maintenance/{id}/rate",
+    tag = "Заявки на обслуживание",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID заявки")
+    ),
+    request_body = RateMaintenanceRequest,
+    responses(
+        (status = 200, description = "Оценка сохранена", body = MaintenanceSuccessResponse),
+        (status = 400, description = "Заявка не завершена или неверная оценка"),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет прав"),
+        (status = 404, description = "Заявка не найдена")
+    )
+)]
 async fn rate_request(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
     Json(payload): Json<RateMaintenanceRequest>,
 ) -> AppResult<Json<Value>> {
-    let req = sqlx::query_as::<_, MaintenanceRequest>(
-        "SELECT * FROM maintenance_requests WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Заявка не найдена".to_string()))?;
+    let req =
+        sqlx::query_as::<_, MaintenanceRequest>("SELECT * FROM maintenance_requests WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Заявка не найдена".to_string()))?;
 
     if req.requester_id != auth_user.user_id {
         return Err(AppError::Forbidden);
     }
 
     if req.status != MaintenanceStatus::Completed {
-        return Err(AppError::BadRequest("Можно оценить только завершённую заявку".to_string()));
+        return Err(AppError::BadRequest(
+            "Можно оценить только завершённую заявку".to_string(),
+        ));
     }
 
     if payload.rating < 1 || payload.rating > 5 {
-        return Err(AppError::BadRequest("Оценка должна быть от 1 до 5".to_string()));
+        return Err(AppError::BadRequest(
+            "Оценка должна быть от 1 до 5".to_string(),
+        ));
     }
 
     sqlx::query(
@@ -294,6 +404,22 @@ async fn rate_request(
     Ok(Json(json!({"success": true})))
 }
 
+/// Получить комментарии к заявке
+#[utoipa::path(
+    get,
+    path = "/api/maintenance/{id}/comments",
+    tag = "Заявки на обслуживание",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID заявки")
+    ),
+    responses(
+        (status = 200, description = "Список комментариев", body = Vec<CommentResponse>),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа"),
+        (status = 404, description = "Заявка не найдена")
+    )
+)]
 async fn get_comments(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -302,20 +428,19 @@ async fn get_comments(
     let complex_id = get_user_complex(&state, auth_user.user_id).await?;
 
     // Проверяем доступ
-    let exists: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM maintenance_requests WHERE id = $1 AND complex_id = $2"
-    )
-    .bind(id)
-    .bind(complex_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let exists: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM maintenance_requests WHERE id = $1 AND complex_id = $2")
+            .bind(id)
+            .bind(complex_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     if exists.is_none() {
         return Err(AppError::NotFound("Заявка не найдена".to_string()));
     }
 
     let comments = sqlx::query_as::<_, MaintenanceComment>(
-        "SELECT * FROM maintenance_comments WHERE request_id = $1 ORDER BY created_at"
+        "SELECT * FROM maintenance_comments WHERE request_id = $1 ORDER BY created_at",
     )
     .bind(id)
     .fetch_all(&state.pool)
@@ -324,7 +449,7 @@ async fn get_comments(
     let mut response = Vec::new();
     for comment in comments {
         let author: (String,) = sqlx::query_as(
-            "SELECT COALESCE(first_name || ' ' || last_name, phone) FROM users WHERE id = $1"
+            "SELECT COALESCE(first_name || ' ' || last_name, phone) FROM users WHERE id = $1",
         )
         .bind(comment.user_id)
         .fetch_one(&state.pool)
@@ -341,6 +466,23 @@ async fn get_comments(
     Ok(Json(response))
 }
 
+/// Добавить комментарий к заявке
+#[utoipa::path(
+    post,
+    path = "/api/maintenance/{id}/comments",
+    tag = "Заявки на обслуживание",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID заявки")
+    ),
+    request_body = AddMaintenanceCommentRequest,
+    responses(
+        (status = 200, description = "Комментарий добавлен", body = CommentCreatedResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет доступа"),
+        (status = 404, description = "Заявка не найдена")
+    )
+)]
 async fn add_comment(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -349,13 +491,12 @@ async fn add_comment(
 ) -> AppResult<Json<Value>> {
     let complex_id = get_user_complex(&state, auth_user.user_id).await?;
 
-    let exists: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM maintenance_requests WHERE id = $1 AND complex_id = $2"
-    )
-    .bind(id)
-    .bind(complex_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let exists: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM maintenance_requests WHERE id = $1 AND complex_id = $2")
+            .bind(id)
+            .bind(complex_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     if exists.is_none() {
         return Err(AppError::NotFound("Заявка не найдена".to_string()));
@@ -366,7 +507,7 @@ async fn add_comment(
         INSERT INTO maintenance_comments (request_id, user_id, content)
         VALUES ($1, $2, $3)
         RETURNING id
-        "#
+        "#,
     )
     .bind(id)
     .bind(auth_user.user_id)

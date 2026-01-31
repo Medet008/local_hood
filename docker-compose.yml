@@ -1,0 +1,77 @@
+# LocalHood Backend Docker Compose
+
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=postgres://localhood:password@postgres:5432/localhood
+      - RUST_LOG=info
+      - JWT_SECRET=your-super-secret-key-min-32-chars-here
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET=localhood
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - localhood-network
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: localhood
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: localhood
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U localhood -d localhood"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - localhood-network
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - localhood-network
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set localminio http://minio:9000 minioadmin minioadmin;
+      mc mb localminio/localhood --ignore-existing;
+      mc anonymous set public localminio/localhood;
+      exit 0;
+      "
+    networks:
+      - localhood-network
+
+volumes:
+  pgdata:
+  minio_data:
+
+networks:
+  localhood-network:
+    driver: bridge

@@ -11,9 +11,22 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 use crate::middleware::{is_chairman_or_higher, is_owner_or_higher, AppState, AuthUser};
 use crate::models::{
-    CastVoteRequest, CreateVotingRequest, Vote, Voting, VotingOption,
-    VotingOptionResponse, VotingResponse, VotingStatus, VotingType,
+    CastVoteRequest, CreateVotingRequest, Voting, VotingOption, VotingOptionResponse,
+    VotingResponse, VotingStatus, VotingType,
 };
+
+/// Успешный ответ
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct SuccessResponse {
+    pub success: bool,
+}
+
+/// Ответ на голосование
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct VoteResponse {
+    pub success: bool,
+    pub message: String,
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -24,11 +37,11 @@ pub fn routes() -> Router<AppState> {
         .route("/:id/close", post(close_voting))
 }
 
-#[derive(Debug, Deserialize)]
-struct VotingsQuery {
-    status: Option<String>,
-    page: Option<i64>,
-    limit: Option<i64>,
+#[derive(Debug, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+pub struct VotingsQuery {
+    pub status: Option<String>,
+    pub page: Option<i64>,
+    pub limit: Option<i64>,
 }
 
 async fn get_user_complex(state: &AppState, user_id: Uuid) -> AppResult<Uuid> {
@@ -39,7 +52,7 @@ async fn get_user_complex(state: &AppState, user_id: Uuid) -> AppResult<Uuid> {
         JOIN apartments a ON a.complex_id = c.id
         WHERE a.owner_id = $1 OR a.resident_id = $1
         LIMIT 1
-        "#
+        "#,
     )
     .bind(user_id)
     .fetch_optional(&state.pool)
@@ -48,7 +61,23 @@ async fn get_user_complex(state: &AppState, user_id: Uuid) -> AppResult<Uuid> {
     complex.map(|(id,)| id).ok_or_else(|| AppError::Forbidden)
 }
 
-async fn list_votings(
+/// Получить список голосований
+#[utoipa::path(
+    get,
+    path = "/api/v1/voting",
+    tag = "voting",
+    security(("bearer_auth" = [])),
+    params(
+        ("status" = Option<String>, Query, description = "Статус (draft, active, closed)"),
+        ("page" = Option<i64>, Query, description = "Номер страницы"),
+        ("limit" = Option<i64>, Query, description = "Количество записей")
+    ),
+    responses(
+        (status = 200, description = "Список голосований", body = Vec<VotingResponse>),
+        (status = 401, description = "Не авторизован")
+    )
+)]
+pub async fn list_votings(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Query(query): Query<VotingsQuery>,
@@ -65,7 +94,7 @@ async fn list_votings(
           AND ($2::varchar IS NULL OR status::text = $2)
         ORDER BY starts_at DESC
         LIMIT $3 OFFSET $4
-        "#
+        "#,
     )
     .bind(complex_id)
     .bind(&query.status)
@@ -88,52 +117,48 @@ async fn build_voting_response(
     user_id: Uuid,
 ) -> AppResult<VotingResponse> {
     let options = sqlx::query_as::<_, VotingOption>(
-        "SELECT * FROM voting_options WHERE voting_id = $1 ORDER BY sort_order"
+        "SELECT * FROM voting_options WHERE voting_id = $1 ORDER BY sort_order",
     )
     .bind(voting.id)
     .fetch_all(&state.pool)
     .await?;
 
-    let total_votes: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM votes WHERE voting_id = $1"
-    )
-    .bind(voting.id)
-    .fetch_one(&state.pool)
-    .await?;
+    let total_votes: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM votes WHERE voting_id = $1")
+        .bind(voting.id)
+        .fetch_one(&state.pool)
+        .await?;
 
-    let total_weight: (Decimal,) = sqlx::query_as(
-        "SELECT COALESCE(SUM(vote_weight), 0) FROM votes WHERE voting_id = $1"
-    )
-    .bind(voting.id)
-    .fetch_one(&state.pool)
-    .await?;
+    let total_weight: (Decimal,) =
+        sqlx::query_as("SELECT COALESCE(SUM(vote_weight), 0) FROM votes WHERE voting_id = $1")
+            .bind(voting.id)
+            .fetch_one(&state.pool)
+            .await?;
 
-    let user_voted: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM votes WHERE voting_id = $1 AND user_id = $2"
-    )
-    .bind(voting.id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let user_voted: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM votes WHERE voting_id = $1 AND user_id = $2")
+            .bind(voting.id)
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     let mut option_responses = Vec::new();
     for opt in options {
-        let votes_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM votes WHERE option_id = $1"
-        )
-        .bind(opt.id)
-        .fetch_one(&state.pool)
-        .await?;
+        let votes_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM votes WHERE option_id = $1")
+            .bind(opt.id)
+            .fetch_one(&state.pool)
+            .await?;
 
-        let votes_weight: (Decimal,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(vote_weight), 0) FROM votes WHERE option_id = $1"
-        )
-        .bind(opt.id)
-        .fetch_one(&state.pool)
-        .await?;
+        let votes_weight: (Decimal,) =
+            sqlx::query_as("SELECT COALESCE(SUM(vote_weight), 0) FROM votes WHERE option_id = $1")
+                .bind(opt.id)
+                .fetch_one(&state.pool)
+                .await?;
 
         let percentage = if total_weight.0 > Decimal::ZERO {
-            (votes_weight.0 / total_weight.0 * Decimal::from(100)).to_string().parse::<f64>().unwrap_or(0.0)
+            (votes_weight.0 / total_weight.0 * Decimal::from(100))
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0)
         } else {
             0.0
         };
@@ -165,51 +190,75 @@ async fn build_voting_response(
     })
 }
 
-async fn get_voting(
+/// Получить голосование по ID
+#[utoipa::path(
+    get,
+    path = "/api/v1/voting/{id}",
+    tag = "voting",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID голосования")
+    ),
+    responses(
+        (status = 200, description = "Голосование", body = VotingResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 404, description = "Не найдено")
+    )
+)]
+pub async fn get_voting(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<VotingResponse>> {
-    let voting = sqlx::query_as::<_, Voting>(
-        "SELECT * FROM votings WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Голосование не найдено".to_string()))?;
+    let voting = sqlx::query_as::<_, Voting>("SELECT * FROM votings WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Голосование не найдено".to_string()))?;
 
     let response = build_voting_response(&state, &voting, auth_user.user_id).await?;
     Ok(Json(response))
 }
 
-async fn create_voting(
+/// Создать голосование
+#[utoipa::path(
+    post,
+    path = "/api/v1/voting",
+    tag = "voting",
+    security(("bearer_auth" = [])),
+    request_body = CreateVotingRequest,
+    responses(
+        (status = 200, description = "Голосование создано", body = VotingResponse),
+        (status = 400, description = "Минимум 2 варианта ответа"),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет прав")
+    )
+)]
+pub async fn create_voting(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Json(payload): Json<CreateVotingRequest>,
 ) -> AppResult<Json<VotingResponse>> {
-    // Проверяем права
-    let complex_id: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT complex_id FROM osi WHERE chairman_id = $1"
-    )
-    .bind(auth_user.user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let complex_id: Option<(Uuid,)> =
+        sqlx::query_as("SELECT complex_id FROM osi WHERE chairman_id = $1")
+            .bind(auth_user.user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
-    let complex_id = complex_id
-        .map(|(id,)| id)
-        .ok_or_else(|| {
-            if is_chairman_or_higher(&auth_user.role) {
-                AppError::BadRequest("complex_id требуется".to_string())
-            } else {
-                AppError::Forbidden
-            }
-        })?;
+    let complex_id = complex_id.map(|(id,)| id).ok_or_else(|| {
+        if is_chairman_or_higher(&auth_user.role) {
+            AppError::BadRequest("complex_id требуется".to_string())
+        } else {
+            AppError::Forbidden
+        }
+    })?;
 
     if payload.options.len() < 2 {
-        return Err(AppError::BadRequest("Минимум 2 варианта ответа".to_string()));
+        return Err(AppError::BadRequest(
+            "Минимум 2 варианта ответа".to_string(),
+        ));
     }
 
-    // Создаем голосование
     let voting = sqlx::query_as::<_, Voting>(
         r#"
         INSERT INTO votings (
@@ -218,12 +267,17 @@ async fn create_voting(
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING *
-        "#
+        "#,
     )
     .bind(complex_id)
     .bind(&payload.title)
     .bind(&payload.description)
-    .bind(payload.voting_type.clone().unwrap_or(VotingType::SingleChoice))
+    .bind(
+        payload
+            .voting_type
+            .clone()
+            .unwrap_or(VotingType::SingleChoice),
+    )
     .bind(VotingStatus::Draft)
     .bind(payload.requires_owner.unwrap_or(true))
     .bind(payload.quorum_percent.unwrap_or(51))
@@ -233,106 +287,111 @@ async fn create_voting(
     .fetch_one(&state.pool)
     .await?;
 
-    // Создаем варианты ответов
     for (i, option_text) in payload.options.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO voting_options (voting_id, text, sort_order) VALUES ($1, $2, $3)"
-        )
-        .bind(voting.id)
-        .bind(option_text)
-        .bind(i as i32)
-        .execute(&state.pool)
-        .await?;
+        sqlx::query("INSERT INTO voting_options (voting_id, text, sort_order) VALUES ($1, $2, $3)")
+            .bind(voting.id)
+            .bind(option_text)
+            .bind(i as i32)
+            .execute(&state.pool)
+            .await?;
     }
 
     let response = build_voting_response(&state, &voting, auth_user.user_id).await?;
     Ok(Json(response))
 }
 
-async fn cast_vote(
+/// Проголосовать
+#[utoipa::path(
+    post,
+    path = "/api/v1/voting/{id}/vote",
+    tag = "voting",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID голосования")
+    ),
+    request_body = CastVoteRequest,
+    responses(
+        (status = 200, description = "Голос принят", body = VoteResponse),
+        (status = 400, description = "Голосование не активно"),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет прав голосовать"),
+        (status = 404, description = "Голосование не найдено"),
+        (status = 409, description = "Вы уже голосовали")
+    )
+)]
+pub async fn cast_vote(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
     Json(payload): Json<CastVoteRequest>,
 ) -> AppResult<Json<Value>> {
-    let voting = sqlx::query_as::<_, Voting>(
-        "SELECT * FROM votings WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Голосование не найдено".to_string()))?;
+    let voting = sqlx::query_as::<_, Voting>("SELECT * FROM votings WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Голосование не найдено".to_string()))?;
 
-    // Проверяем статус
     if voting.status != VotingStatus::Active {
         return Err(AppError::BadRequest("Голосование не активно".to_string()));
     }
 
-    // Проверяем время
     let now = chrono::Utc::now();
     if now < voting.starts_at || now > voting.ends_at {
-        return Err(AppError::BadRequest("Голосование не в активном периоде".to_string()));
+        return Err(AppError::BadRequest(
+            "Голосование не в активном периоде".to_string(),
+        ));
     }
 
-    // Проверяем права на голосование
     if voting.requires_owner && !is_owner_or_higher(&auth_user.role) {
         return Err(AppError::Forbidden);
     }
 
-    // Проверяем, не голосовал ли уже
-    let existing_vote: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM votes WHERE voting_id = $1 AND user_id = $2"
-    )
-    .bind(id)
-    .bind(auth_user.user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let existing_vote: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM votes WHERE voting_id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(auth_user.user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     if existing_vote.is_some() {
         return Err(AppError::Conflict("Вы уже голосовали".to_string()));
     }
 
-    // Проверяем опцию
-    let option_exists: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM voting_options WHERE id = $1 AND voting_id = $2"
-    )
-    .bind(payload.option_id)
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let option_exists: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM voting_options WHERE id = $1 AND voting_id = $2")
+            .bind(payload.option_id)
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     if option_exists.is_none() {
         return Err(AppError::BadRequest("Неверный вариант ответа".to_string()));
     }
 
-    // Получаем вес голоса (по площади квартиры)
     let vote_weight: (Decimal,) = sqlx::query_as(
         r#"
         SELECT COALESCE(SUM(area), 1)
         FROM apartments
         WHERE complex_id = $1 AND owner_id = $2
-        "#
+        "#,
     )
     .bind(voting.complex_id)
     .bind(auth_user.user_id)
     .fetch_one(&state.pool)
     .await?;
 
-    // Получаем квартиру
-    let apartment_id: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM apartments WHERE complex_id = $1 AND owner_id = $2 LIMIT 1"
-    )
-    .bind(voting.complex_id)
-    .bind(auth_user.user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let apartment_id: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM apartments WHERE complex_id = $1 AND owner_id = $2 LIMIT 1")
+            .bind(voting.complex_id)
+            .bind(auth_user.user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
-    // Голосуем
     sqlx::query(
         r#"
         INSERT INTO votes (voting_id, option_id, user_id, apartment_id, vote_weight)
         VALUES ($1, $2, $3, $4, $5)
-        "#
+        "#,
     )
     .bind(id)
     .bind(payload.option_id)
@@ -348,20 +407,33 @@ async fn cast_vote(
     })))
 }
 
-async fn close_voting(
+/// Закрыть голосование
+#[utoipa::path(
+    post,
+    path = "/api/v1/voting/{id}/close",
+    tag = "voting",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID голосования")
+    ),
+    responses(
+        (status = 200, description = "Голосование закрыто", body = SuccessResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет прав"),
+        (status = 404, description = "Не найдено")
+    )
+)]
+pub async fn close_voting(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
-    let voting = sqlx::query_as::<_, Voting>(
-        "SELECT * FROM votings WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Голосование не найдено".to_string()))?;
+    let voting = sqlx::query_as::<_, Voting>("SELECT * FROM votings WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Голосование не найдено".to_string()))?;
 
-    // Проверяем права
     if voting.created_by != auth_user.user_id && !is_chairman_or_higher(&auth_user.role) {
         return Err(AppError::Forbidden);
     }

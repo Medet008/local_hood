@@ -22,7 +22,9 @@ use utoipa::OpenApi;
         (name = "apartments", description = "Квартиры и заявки на присоединение"),
         (name = "osi", description = "ОСИ/УК - Объединения собственников имущества"),
         (name = "security", description = "Безопасность: шлагбаум, камеры, домофон"),
-        (name = "announcements", description = "Объявления")
+        (name = "announcements", description = "Объявления"),
+        (name = "marketplace", description = "AllMix - маркетплейс между соседями"),
+        (name = "voting", description = "Голосования собственников")
     ),
     paths(
         // Auth
@@ -78,6 +80,23 @@ use utoipa::OpenApi;
         crate::api::announcements::update_announcement,
         crate::api::announcements::delete_announcement,
         crate::api::announcements::mark_as_read,
+        // Marketplace
+        crate::api::marketplace::get_categories,
+        crate::api::marketplace::list_listings,
+        crate::api::marketplace::get_listing,
+        crate::api::marketplace::create_listing,
+        crate::api::marketplace::update_listing,
+        crate::api::marketplace::delete_listing,
+        crate::api::marketplace::toggle_favorite,
+        crate::api::marketplace::send_message,
+        crate::api::marketplace::my_listings,
+        crate::api::marketplace::my_favorites,
+        // Voting
+        crate::api::voting::list_votings,
+        crate::api::voting::get_voting,
+        crate::api::voting::create_voting,
+        crate::api::voting::cast_vote,
+        crate::api::voting::close_voting,
     ),
     components(
         schemas(
@@ -147,6 +166,27 @@ use utoipa::OpenApi;
             crate::models::CreateAnnouncementRequest,
             crate::models::UpdateAnnouncementRequest,
             crate::api::announcements::SuccessResponse,
+            // Marketplace
+            crate::models::CategoryResponse,
+            crate::models::ListingResponse,
+            crate::models::ListingStatus,
+            crate::models::SellerInfo,
+            crate::models::CreateListingRequest,
+            crate::models::UpdateListingRequest,
+            crate::models::ListingsQuery,
+            crate::models::SendMessageRequest,
+            crate::api::marketplace::FavoriteResponse,
+            crate::api::marketplace::SuccessResponse,
+            // Voting
+            crate::models::VotingType,
+            crate::models::VotingStatus,
+            crate::models::VotingResponse,
+            crate::models::VotingOptionResponse,
+            crate::models::CreateVotingRequest,
+            crate::models::CastVoteRequest,
+            crate::api::voting::SuccessResponse,
+            crate::api::voting::VoteResponse,
+            crate::api::voting::VotingsQuery,
         )
     ),
     modifiers(&SecurityAddon)

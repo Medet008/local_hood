@@ -9,10 +9,21 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 use crate::middleware::{AppState, AuthUser};
 use crate::models::{
-    CategoryResponse, CreateListingRequest, ListingResponse, ListingStatus,
-    ListingsQuery, MarketplaceCategory, MarketplaceListing, SellerInfo,
-    SendMessageRequest, UpdateListingRequest,
+    CategoryResponse, CreateListingRequest, ListingResponse, ListingStatus, ListingsQuery,
+    MarketplaceCategory, MarketplaceListing, SellerInfo, SendMessageRequest, UpdateListingRequest,
 };
+
+/// Ответ на toggle favorite
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct FavoriteResponse {
+    pub is_favorite: bool,
+}
+
+/// Успешный ответ
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct SuccessResponse {
+    pub success: bool,
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -36,7 +47,7 @@ async fn get_user_complex(state: &AppState, user_id: Uuid) -> AppResult<Uuid> {
         JOIN apartments a ON a.complex_id = c.id
         WHERE a.owner_id = $1 OR a.resident_id = $1
         LIMIT 1
-        "#
+        "#,
     )
     .bind(user_id)
     .fetch_optional(&state.pool)
@@ -45,20 +56,49 @@ async fn get_user_complex(state: &AppState, user_id: Uuid) -> AppResult<Uuid> {
     complex.map(|(id,)| id).ok_or_else(|| AppError::Forbidden)
 }
 
-async fn get_categories(
+/// Получить категории маркетплейса
+#[utoipa::path(
+    get,
+    path = "/api/v1/marketplace/categories",
+    tag = "marketplace",
+    responses(
+        (status = 200, description = "Список категорий", body = Vec<CategoryResponse>)
+    )
+)]
+pub async fn get_categories(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<CategoryResponse>>> {
     let categories = sqlx::query_as::<_, MarketplaceCategory>(
-        "SELECT * FROM marketplace_categories WHERE is_active = true ORDER BY sort_order"
+        "SELECT * FROM marketplace_categories WHERE is_active = true ORDER BY sort_order",
     )
     .fetch_all(&state.pool)
     .await?;
 
-    let response: Vec<CategoryResponse> = categories.into_iter().map(CategoryResponse::from).collect();
+    let response: Vec<CategoryResponse> =
+        categories.into_iter().map(CategoryResponse::from).collect();
     Ok(Json(response))
 }
 
-async fn list_listings(
+/// Получить список объявлений
+#[utoipa::path(
+    get,
+    path = "/api/v1/marketplace/listings",
+    tag = "marketplace",
+    security(("bearer_auth" = [])),
+    params(
+        ("category" = Option<String>, Query, description = "ID категории"),
+        ("query" = Option<String>, Query, description = "Поисковый запрос"),
+        ("min_price" = Option<f64>, Query, description = "Минимальная цена"),
+        ("max_price" = Option<f64>, Query, description = "Максимальная цена"),
+        ("page" = Option<i64>, Query, description = "Номер страницы"),
+        ("limit" = Option<i64>, Query, description = "Количество записей")
+    ),
+    responses(
+        (status = 200, description = "Список объявлений", body = Vec<ListingResponse>),
+        (status = 401, description = "Не авторизован")
+    )
+)]
+pub async fn list_listings(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Query(query): Query<ListingsQuery>,
@@ -80,10 +120,15 @@ async fn list_listings(
           AND ($5::decimal IS NULL OR l.price <= $5)
         ORDER BY l.created_at DESC
         LIMIT $6 OFFSET $7
-        "#
+        "#,
     )
     .bind(complex_id)
-    .bind(query.category.as_ref().and_then(|c| Uuid::parse_str(c).ok()))
+    .bind(
+        query
+            .category
+            .as_ref()
+            .and_then(|c| Uuid::parse_str(c).ok()),
+    )
     .bind(&search_pattern)
     .bind(&query.min_price)
     .bind(&query.max_price)
@@ -106,33 +151,30 @@ async fn build_listing_response(
     user_id: Uuid,
 ) -> AppResult<ListingResponse> {
     let category = sqlx::query_as::<_, MarketplaceCategory>(
-        "SELECT * FROM marketplace_categories WHERE id = $1"
+        "SELECT * FROM marketplace_categories WHERE id = $1",
     )
     .bind(listing.category_id)
     .fetch_one(&state.pool)
     .await?;
 
-    let seller: (Uuid, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT id, first_name, last_name, avatar_url FROM users WHERE id = $1"
-    )
-    .bind(listing.seller_id)
-    .fetch_one(&state.pool)
-    .await?;
+    let seller: (Uuid, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT id, first_name, last_name, avatar_url FROM users WHERE id = $1")
+            .bind(listing.seller_id)
+            .fetch_one(&state.pool)
+            .await?;
 
-    let photos: Vec<(String,)> = sqlx::query_as(
-        "SELECT url FROM listing_photos WHERE listing_id = $1 ORDER BY sort_order"
-    )
-    .bind(listing.id)
-    .fetch_all(&state.pool)
-    .await?;
+    let photos: Vec<(String,)> =
+        sqlx::query_as("SELECT url FROM listing_photos WHERE listing_id = $1 ORDER BY sort_order")
+            .bind(listing.id)
+            .fetch_all(&state.pool)
+            .await?;
 
-    let is_favorite: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM listing_favorites WHERE listing_id = $1 AND user_id = $2"
-    )
-    .bind(listing.id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let is_favorite: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM listing_favorites WHERE listing_id = $1 AND user_id = $2")
+            .bind(listing.id)
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     Ok(ListingResponse {
         id: listing.id,
@@ -146,7 +188,13 @@ async fn build_listing_response(
         category: CategoryResponse::from(category),
         seller: SellerInfo {
             id: seller.0,
-            name: format!("{} {}", seller.1.unwrap_or_default(), seller.2.unwrap_or_default()).trim().to_string(),
+            name: format!(
+                "{} {}",
+                seller.1.unwrap_or_default(),
+                seller.2.unwrap_or_default()
+            )
+            .trim()
+            .to_string(),
             avatar_url: seller.3,
         },
         photos: photos.into_iter().map(|(url,)| url).collect(),
@@ -157,20 +205,33 @@ async fn build_listing_response(
     })
 }
 
-async fn get_listing(
+/// Получить объявление по ID
+#[utoipa::path(
+    get,
+    path = "/api/v1/marketplace/listings/{id}",
+    tag = "marketplace",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID объявления")
+    ),
+    responses(
+        (status = 200, description = "Объявление", body = ListingResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 404, description = "Не найдено")
+    )
+)]
+pub async fn get_listing(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ListingResponse>> {
-    let listing = sqlx::query_as::<_, MarketplaceListing>(
-        "SELECT * FROM marketplace_listings WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Объявление не найдено".to_string()))?;
+    let listing =
+        sqlx::query_as::<_, MarketplaceListing>("SELECT * FROM marketplace_listings WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Объявление не найдено".to_string()))?;
 
-    // Увеличиваем просмотры
     sqlx::query("UPDATE marketplace_listings SET views_count = views_count + 1 WHERE id = $1")
         .bind(id)
         .execute(&state.pool)
@@ -180,7 +241,19 @@ async fn get_listing(
     Ok(Json(response))
 }
 
-async fn create_listing(
+/// Создать объявление
+#[utoipa::path(
+    post,
+    path = "/api/v1/marketplace/listings",
+    tag = "marketplace",
+    security(("bearer_auth" = [])),
+    request_body = CreateListingRequest,
+    responses(
+        (status = 200, description = "Объявление создано", body = ListingResponse),
+        (status = 401, description = "Не авторизован")
+    )
+)]
+pub async fn create_listing(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Json(payload): Json<CreateListingRequest>,
@@ -195,7 +268,7 @@ async fn create_listing(
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING *
-        "#
+        "#,
     )
     .bind(complex_id)
     .bind(auth_user.user_id)
@@ -214,19 +287,35 @@ async fn create_listing(
     Ok(Json(response))
 }
 
-async fn update_listing(
+/// Обновить объявление
+#[utoipa::path(
+    put,
+    path = "/api/v1/marketplace/listings/{id}",
+    tag = "marketplace",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID объявления")
+    ),
+    request_body = UpdateListingRequest,
+    responses(
+        (status = 200, description = "Объявление обновлено", body = ListingResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет прав"),
+        (status = 404, description = "Не найдено")
+    )
+)]
+pub async fn update_listing(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateListingRequest>,
 ) -> AppResult<Json<ListingResponse>> {
-    let listing = sqlx::query_as::<_, MarketplaceListing>(
-        "SELECT * FROM marketplace_listings WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Объявление не найдено".to_string()))?;
+    let listing =
+        sqlx::query_as::<_, MarketplaceListing>("SELECT * FROM marketplace_listings WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Объявление не найдено".to_string()))?;
 
     if listing.seller_id != auth_user.user_id {
         return Err(AppError::Forbidden);
@@ -246,7 +335,7 @@ async fn update_listing(
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
-        "#
+        "#,
     )
     .bind(id)
     .bind(&payload.category_id)
@@ -264,18 +353,33 @@ async fn update_listing(
     Ok(Json(response))
 }
 
-async fn delete_listing(
+/// Удалить объявление
+#[utoipa::path(
+    delete,
+    path = "/api/v1/marketplace/listings/{id}",
+    tag = "marketplace",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID объявления")
+    ),
+    responses(
+        (status = 200, description = "Объявление удалено", body = SuccessResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 403, description = "Нет прав"),
+        (status = 404, description = "Не найдено")
+    )
+)]
+pub async fn delete_listing(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
-    let listing = sqlx::query_as::<_, MarketplaceListing>(
-        "SELECT * FROM marketplace_listings WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Объявление не найдено".to_string()))?;
+    let listing =
+        sqlx::query_as::<_, MarketplaceListing>("SELECT * FROM marketplace_listings WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Объявление не найдено".to_string()))?;
 
     if listing.seller_id != auth_user.user_id {
         return Err(AppError::Forbidden);
@@ -289,69 +393,98 @@ async fn delete_listing(
     Ok(Json(json!({"success": true})))
 }
 
-async fn toggle_favorite(
+/// Добавить/удалить из избранного
+#[utoipa::path(
+    post,
+    path = "/api/v1/marketplace/listings/{id}/favorite",
+    tag = "marketplace",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID объявления")
+    ),
+    responses(
+        (status = 200, description = "Статус избранного изменён", body = FavoriteResponse),
+        (status = 401, description = "Не авторизован")
+    )
+)]
+pub async fn toggle_favorite(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
-    // Проверяем, есть ли уже в избранном
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM listing_favorites WHERE listing_id = $1 AND user_id = $2"
-    )
-    .bind(id)
-    .bind(auth_user.user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let existing: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM listing_favorites WHERE listing_id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(auth_user.user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     if let Some((fav_id,)) = existing {
-        // Удаляем из избранного
         sqlx::query("DELETE FROM listing_favorites WHERE id = $1")
             .bind(fav_id)
             .execute(&state.pool)
             .await?;
 
-        sqlx::query("UPDATE marketplace_listings SET favorites_count = favorites_count - 1 WHERE id = $1")
-            .bind(id)
-            .execute(&state.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE marketplace_listings SET favorites_count = favorites_count - 1 WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
 
         Ok(Json(json!({"is_favorite": false})))
     } else {
-        // Добавляем в избранное
         sqlx::query("INSERT INTO listing_favorites (listing_id, user_id) VALUES ($1, $2)")
             .bind(id)
             .bind(auth_user.user_id)
             .execute(&state.pool)
             .await?;
 
-        sqlx::query("UPDATE marketplace_listings SET favorites_count = favorites_count + 1 WHERE id = $1")
-            .bind(id)
-            .execute(&state.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE marketplace_listings SET favorites_count = favorites_count + 1 WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
 
         Ok(Json(json!({"is_favorite": true})))
     }
 }
 
-async fn send_message(
+/// Отправить сообщение продавцу
+#[utoipa::path(
+    post,
+    path = "/api/v1/marketplace/listings/{id}/message",
+    tag = "marketplace",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "ID объявления")
+    ),
+    request_body = SendMessageRequest,
+    responses(
+        (status = 200, description = "Сообщение отправлено", body = SuccessResponse),
+        (status = 401, description = "Не авторизован"),
+        (status = 404, description = "Объявление не найдено")
+    )
+)]
+pub async fn send_message(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
     Json(payload): Json<SendMessageRequest>,
 ) -> AppResult<Json<Value>> {
-    let listing = sqlx::query_as::<_, MarketplaceListing>(
-        "SELECT * FROM marketplace_listings WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Объявление не найдено".to_string()))?;
+    let listing =
+        sqlx::query_as::<_, MarketplaceListing>("SELECT * FROM marketplace_listings WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Объявление не найдено".to_string()))?;
 
     sqlx::query(
         r#"
         INSERT INTO listing_messages (listing_id, sender_id, recipient_id, message)
         VALUES ($1, $2, $3, $4)
-        "#
+        "#,
     )
     .bind(id)
     .bind(auth_user.user_id)
@@ -363,7 +496,18 @@ async fn send_message(
     Ok(Json(json!({"success": true})))
 }
 
-async fn my_listings(
+/// Мои объявления
+#[utoipa::path(
+    get,
+    path = "/api/v1/marketplace/my-listings",
+    tag = "marketplace",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Список моих объявлений", body = Vec<ListingResponse>),
+        (status = 401, description = "Не авторизован")
+    )
+)]
+pub async fn my_listings(
     State(state): State<AppState>,
     auth_user: AuthUser,
 ) -> AppResult<Json<Vec<ListingResponse>>> {
@@ -372,7 +516,7 @@ async fn my_listings(
         SELECT * FROM marketplace_listings
         WHERE seller_id = $1 AND status != 'archived'
         ORDER BY created_at DESC
-        "#
+        "#,
     )
     .bind(auth_user.user_id)
     .fetch_all(&state.pool)
@@ -386,7 +530,18 @@ async fn my_listings(
     Ok(Json(response))
 }
 
-async fn my_favorites(
+/// Мои избранные объявления
+#[utoipa::path(
+    get,
+    path = "/api/v1/marketplace/favorites",
+    tag = "marketplace",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Список избранных", body = Vec<ListingResponse>),
+        (status = 401, description = "Не авторизован")
+    )
+)]
+pub async fn my_favorites(
     State(state): State<AppState>,
     auth_user: AuthUser,
 ) -> AppResult<Json<Vec<ListingResponse>>> {
@@ -396,7 +551,7 @@ async fn my_favorites(
         JOIN listing_favorites f ON f.listing_id = l.id
         WHERE f.user_id = $1 AND l.status = 'active'
         ORDER BY f.created_at DESC
-        "#
+        "#,
     )
     .bind(auth_user.user_id)
     .fetch_all(&state.pool)
